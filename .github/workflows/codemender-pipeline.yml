@@ -35,6 +35,7 @@ on:
 permissions:
   contents: write          # create the remediation branch / commit the patch
   pull-requests: write     # open the autonomous remediation PR
+  id-token: write          # authenticate with Google Cloud via WIF
 
 env:
   # Scoped scan target. Kept well under cm's ~10 MB per-scan upload limit and
@@ -59,6 +60,12 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0          # full history so cm can evaluate code context
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: 'projects/726835061354/locations/global/workloadIdentityPools/github-actions-pool/providers/github-actions-provider'
+          service_account: 'codemender-runner@vertex-security-4f90bf.iam.gserviceaccount.com'
 
       - name: Install CodeMender CLI (cm)
         run: |
@@ -86,7 +93,7 @@ jobs:
       - name: CodeMender Scan (cm find)
         id: scan
         env:
-          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+          GOOGLE_CLOUD_PROJECT: vertex-security-4f90bf
         run: |
           set -uo pipefail
           echo "Scanning '$SCAN_PATH' (source is uploaded to codemender.pa.googleapis.com)..."
@@ -119,7 +126,7 @@ jobs:
         # Open a remediation PR on push or manual run; PR events only scan+gate.
         if: ${{ github.event_name != 'pull_request' && steps.triage.outputs.fix_ids != '' }}
         env:
-          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+          GOOGLE_CLOUD_PROJECT: vertex-security-4f90bf
         run: |
           set -uo pipefail
           echo "Remediating top finding(s): ${{ steps.triage.outputs.fix_ids }}"
