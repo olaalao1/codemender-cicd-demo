@@ -96,9 +96,9 @@ Open `.github/workflows/codemender-pipeline.yml`. It runs on every push to
 | **Install** | `actions/cache` + `curl` (Artifact Registry) | Pulls `cm` `0.3.0` from Google Cloud Artifact Registry and caches it across runs |
 | **Auth** | `google-github-actions/auth` | Authenticates via Workload Identity Federation (WIF) with temporary ADC tokens |
 | **Init** | `cm init` | Mints the local CodeMender identity key and configures Git VCS |
-| **Scan** | `cm find routes -y` | Uploads `routes/` and runs the server-side scan via Vertex AI |
+| **Scan** | `cm find routes/login.ts -y` | Uploads the in-scope source and runs the server-side scan via Vertex AI |
 | **Report** | `cm report -f json` | Exports findings → uploaded as the **`codemender-report`** artifact |
-| **Triage** | `cm_triage.py` | Counts HIGH/CRITICAL, ranks them, selects the top **N** (default 3) to fix |
+| **Triage** | `cm_triage.py` | Counts HIGH/CRITICAL, ranks them, selects the top **`CM_FIX_LIMIT`** (default 1) to fix |
 | **Patch** | `cm fix <id>` (looped over top-N) | Generates + applies a security patch for each selected finding |
 | **PR** | `peter-evans/create-pull-request` | Opens one remediation PR containing all the patches |
 | **Gate** | (exit 1 if HIGH/CRITICAL) | Turns the run **red** and blocks deployment |
@@ -108,6 +108,144 @@ Open `.github/workflows/codemender-pipeline.yml`. It runs on every push to
 > build**: parse `cm report -f json` and fail the job on HIGH/CRITICAL. That's
 > the `cm_triage.py` + "Security Gate" steps. This is the real, transferable
 > pattern for wiring any scanner into a pipeline.
+
+---
+
+## 🏗️ Architecture & Component Flow
+
+The guardrail is a **local-executor / cloud-reasoner** architecture. The `cm` CLI
+runs on the ephemeral GitHub runner and owns all filesystem and Git operations,
+while vulnerability reasoning and patch synthesis happen server-side in Google
+Cloud. Nothing but the **in-scope source** (`routes/login.ts`) crosses the trust
+boundary, and the runner holds **no static credentials** — Workload Identity
+Federation exchanges a short-lived GitHub OIDC token for ADC.
+
+### Component topology
+
+```mermaid
+flowchart LR
+    subgraph GH["🐙 GitHub Control Plane"]
+        direction TB
+        DEV["Developer push to main<br/>or workflow_dispatch"]
+        WF["codemender-pipeline.yml<br/>job: codemender-security"]
+        ART["Artifact: codemender-report"]
+        RPR["PR branch:<br/>codemender/auto-remediation"]
+        GATE{"Security Gate<br/>HIGH/CRITICAL > 0 ?"}
+    end
+
+    subgraph RUN["🧰 Ephemeral Runner (ubuntu-latest)"]
+        direction TB
+        CLI["cm CLI v0.3.0<br/>(local executor)"]
+        TRI["cm_triage.py<br/>(gate decision)"]
+        EXT["extract_cm_diff.py<br/>+ git apply"]
+    end
+
+    subgraph GCP["☁️ Google Cloud"]
+        direction TB
+        AR["Artifact Registry<br/>cmoc-prod / codemender-cli-production"]
+        WIF["Workload Identity Federation<br/>OIDC to short-lived ADC"]
+        SVC["CodeMender Service<br/>codemender.pa.googleapis.com"]
+        VTX["Server-side AI agent<br/>(Vertex AI / Gemini)"]
+    end
+
+    DEV --> WF --> CLI
+    WF -->|"cached curl download"| AR
+    WF -->|"id-token: write"| WIF
+    WIF -.->|"short-lived ADC"| CLI
+    CLI -->|"cm find / cm fix<br/>uploads in-scope source"| SVC
+    SVC --> VTX
+    VTX -.->|"findings + patches"| CLI
+    CLI -->|"cm report -f json"| TRI
+    TRI --> ART
+    TRI --> GATE
+    CLI --> EXT --> RPR
+    GATE -->|"Yes: exit 1"| RED["🔴 Deployment blocked"]
+    GATE -->|"No: exit 0"| GREEN["🟢 Deployment allowed"]
+```
+
+### End-to-end component flow
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Developer
+    participant Repo as GitHub Repo (main)
+    participant Runner as Actions Runner (ubuntu-latest)
+    participant AR as Artifact Registry (cmoc-prod)
+    participant WIF as Workload Identity Federation
+    participant CM as CodeMender Service + Vertex AI
+    participant PR as Remediation PR
+
+    Developer->>Repo: Push to main (doc-only paths ignored)
+    Repo->>Runner: Trigger "CodeMender CI/CD Guardrail"
+    Runner->>Repo: actions/checkout@v4 (fetch-depth: 0)
+
+    Note over Runner,WIF: Bootstrap — no static keys
+    Runner->>AR: Download cm 0.3.0 (cache miss only)
+    Runner->>WIF: Exchange GitHub OIDC token
+    WIF-->>Runner: Short-lived ADC credentials
+    Runner->>Runner: cm init (mint identity.key, VCS=git, disable prompts)
+
+    Note over Runner,CM: Scan — source leaves the runner
+    Runner->>CM: cm find routes/login.ts -y
+    CM-->>Runner: Findings (severity, confidence, finding IDs)
+    Runner->>Runner: cm report -f json
+    Runner->>Repo: Upload artifact "codemender-report"
+    Runner->>Runner: cm_triage.py to high_critical, fix_ids, fix_count
+
+    alt HIGH/CRITICAL findings present
+        loop Top CM_FIX_LIMIT findings (default 1)
+            Runner->>CM: cm fix FINDING_ID -y
+            CM-->>Runner: Patched file or printed unified diff
+            Runner->>Runner: extract_cm_diff.py + git apply (idempotent fallback)
+        end
+        Runner->>PR: Open codemender/auto-remediation PR
+        Runner->>Repo: Security Gate to exit 1
+        Note over Repo: 🔴 Run is RED — deployment blocked
+    else No HIGH/CRITICAL findings
+        Runner->>Repo: Security Gate to exit 0
+        Note over Repo: 🟢 Run is GREEN — deployment allowed
+    end
+
+    Developer->>PR: Review diff, then merge the fix
+```
+
+### Component reference
+
+| Component | Where it runs | Responsibility |
+|---|---|---|
+| `codemender-pipeline.yml` | GitHub Actions | Orchestrates the guardrail; declares `contents`/`pull-requests`/`id-token` permissions |
+| `actions/cache@v4` | Runner | Caches `cm` in `$RUNNER_TEMP/cmbin`, keyed on OS + arch + `CM_VERSION` |
+| Artifact Registry | Google Cloud | Hosts the signed `cm` CLI release (`cmoc-prod`) |
+| `google-github-actions/auth@v2` | Runner → GCP | Trades the GitHub OIDC token for short-lived ADC via WIF |
+| `cm init` | Runner | Mints `~/.codemender/identity.key`; sets `vcs.type: git` and disables interactive prompts for CI |
+| `cm find` | Runner → CodeMender | Uploads `SCAN_PATH` and runs the server-side AI scan |
+| `cm report -f json` | Runner | Serializes findings for machine consumption + the audit artifact |
+| `cm_triage.py` | Runner | Counts blocking findings, ranks by severity then confidence, emits step outputs |
+| `cm fix` | Runner → CodeMender | Synthesizes a patch per selected finding |
+| `extract_cm_diff.py` | Runner | Recovers the printed diff and `git apply`s it only if `cm` did not already write it |
+| `peter-evans/create-pull-request@v6` | Runner | Bundles all patches into one reviewable PR |
+| Security Gate | Runner | The **deploy decision** — `exit 1` on any HIGH/CRITICAL |
+
+> [!IMPORTANT]
+> **The gate and the fix are deliberately decoupled.** `cm_triage.py` never exits
+> non-zero, so remediation and PR creation always run *before* the gate. The run
+> stays **red** even though the fix PR exists — the pipeline only turns green once
+> a human reviews and merges that PR, which is what makes this a guardrail rather
+> than an auto-merge bot.
+
+### Trust boundaries
+
+1. **Runner → Google Cloud** — keyless. WIF issues short-lived ADC scoped to the
+   `GCP_SERVICE_ACCOUNT`; no service-account JSON is ever stored in the repo.
+2. **Source egress** — `cm find`/`cm fix` upload only the files under
+   `SCAN_PATH`. Scoping to `routes/login.ts` keeps the run at ~1–2 min and stays
+   well under the ~10 MB per-scan upload limit.
+3. **Write scope** — the workflow's `GITHUB_TOKEN` can write to the
+   `codemender/auto-remediation` branch only; `main` is reached exclusively
+   through the reviewed PR.
+
+---
 
 ## Step 4 — Trigger and test the agent
 

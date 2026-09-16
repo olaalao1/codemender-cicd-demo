@@ -7,6 +7,7 @@ app is **OWASP Juice Shop** (intentionally vulnerable).
 
 ➡️ **Students start here:** [`lab/README.md`](./lab/README.md)
 ➡️ **Instructors / graders:** [`lab/INSTRUCTOR.md`](./lab/INSTRUCTOR.md)
+➡️ **Architecture & component flow:** [`lab/README.md#-architecture--component-flow`](./lab/README.md#-architecture--component-flow)
 
 The pipeline lives at
 [`.github/workflows/codemender-pipeline.yml`](./.github/workflows/codemender-pipeline.yml).
